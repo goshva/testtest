@@ -10,14 +10,15 @@ class SteamMarketMonitor:
     def __init__(self):
         self.config = self.load_config()
         self.items = self.config.get('items_to_track', [])
-        self.check_interval = self.config.get('check_interval', 36)  # по умолчанию 1 минута
+        self.check_interval = self.config.get('check_interval', 3600)
         self.output_file = self.config.get('output_file', 'steam_prices.xlsx')
         self.history_file = self.config.get('history_file', 'price_history.json')
         self.price_history = self.load_history()
         
-        # Создаем файл если его нет
+        # Инициализация файла с заголовками если его нет
         if not os.path.exists(self.output_file):
-            pd.DataFrame(columns=['Item', 'Price', 'Timestamp', 'Change']).to_excel(self.output_file, index=False)
+            with pd.ExcelWriter(self.output_file, engine='openpyxl') as writer:
+                pd.DataFrame(columns=['Item', 'Price', 'Timestamp', 'Change']).to_excel(writer, index=False)
 
     def load_config(self):
         """Загружаем конфигурацию из файла"""
@@ -25,13 +26,12 @@ class SteamMarketMonitor:
             with open('config.json', 'r', encoding='utf-8') as f:
                 return json.load(f)
         except FileNotFoundError:
-            # Конфиг по умолчанию
             default_config = {
                 'items_to_track': [
                     'AK-47 | Redline (Field-Tested)',
                     'AWP | Asiimov (Field-Tested)'
                 ],
-                'check_interval': 36,
+                'check_interval': 3600,
                 'output_file': 'steam_prices.xlsx',
                 'history_file': 'price_history.json'
             }
@@ -90,34 +90,20 @@ class SteamMarketMonitor:
                 changes.append((item, previous_price, price, change, change_percent))
                 print(f"ИЗМЕНЕНИЕ: {item} - было ${previous_price:.2f}, стало ${price:.2f} ({change:+.2f}, {change_percent:+.2f}%)")
             
-            # Обновляем историю
             self.price_history[item] = price
         
-        # Сохраняем историю
         self.save_history()
-        
-        # Если есть изменения - обновляем таблицу
-        if changes or not os.path.exists(self.output_file):
-            self.update_spreadsheet(current_prices, changes)
-        
+        self.update_spreadsheet(current_prices, changes)
         return changes
 
     def update_spreadsheet(self, current_prices, changes):
         """Обновляем таблицу Excel с текущими ценами"""
         try:
-            # Читаем существующие данные
-            try:
-                df = pd.read_excel(self.output_file)
-            except FileNotFoundError:
-                df = pd.DataFrame(columns=['Item', 'Price', 'Timestamp', 'Change'])
-            
-            # Добавляем новые данные
+            # Создаем новый DataFrame с текущими данными
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            # Создаем DataFrame с текущими ценами
             new_data = []
+            
             for item, price in current_prices.items():
-                # Находим изменение цены если есть
                 change_info = next((c for c in changes if c[0] == item), None)
                 change = change_info[3] if change_info else 0
                 
@@ -128,12 +114,24 @@ class SteamMarketMonitor:
                     'Change': change
                 })
             
-            # Объединяем с существующими данными
-            df = pd.concat([df, pd.DataFrame(new_data)], ignore_index=True)
+            new_df = pd.DataFrame(new_data)
             
-            # Сохраняем в Excel
-            df.to_excel(self.output_file, index=False)
-            print(f"Таблица {self.output_file} успешно обновлена")
+            # Читаем существующие данные и объединяем с новыми
+            if os.path.exists(self.output_file):
+                try:
+                    existing_df = pd.read_excel(self.output_file)
+                    combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                except Exception as e:
+                    print(f"Ошибка при чтении существующего файла, создаем новый: {e}")
+                    combined_df = new_df
+            else:
+                combined_df = new_df
+            
+            # Сохраняем данные
+            with pd.ExcelWriter(self.output_file, engine='openpyxl') as writer:
+                combined_df.to_excel(writer, index=False)
+            
+            print(f"Данные успешно записаны в {self.output_file}")
             
         except Exception as e:
             print(f"Ошибка при обновлении таблицы: {e}")
@@ -142,7 +140,7 @@ class SteamMarketMonitor:
         """Запускаем мониторинг"""
         print("Steam Market Monitor запущен")
         print(f"Отслеживаем предметы: {', '.join(self.items)}")
-        print(f"Интервал  проверки: {self.check_interval} секунд")
+        print(f"Интервал проверки: {self.check_interval} секунд")
         
         try:
             while True:
