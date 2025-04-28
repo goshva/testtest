@@ -1,8 +1,7 @@
 import requests
-from bs4 import BeautifulSoup
-import pandas as pd
-import time
+import sqlite3
 from datetime import datetime
+import time
 import json
 import os
 
@@ -10,15 +9,11 @@ class SteamMarketMonitor:
     def __init__(self):
         self.config = self.load_config()
         self.items = self.config.get('items_to_track', [])
-        self.check_interval = self.config.get('check_interval', 3600)
-        self.output_file = self.config.get('output_file', 'steam_prices.xlsx')
-        self.history_file = self.config.get('history_file', 'price_history.json')
-        self.price_history = self.load_history()
+        self.check_interval = self.config.get('check_interval', 36)
+        self.db_file = self.config.get('db_file', 'steam_prices.db')
         
-        # Инициализация файла с заголовками если его нет
-        if not os.path.exists(self.output_file):
-            with pd.ExcelWriter(self.output_file, engine='openpyxl') as writer:
-                pd.DataFrame(columns=['Item', 'Price', 'Timestamp', 'Change']).to_excel(writer, index=False)
+        # Инициализация базы данных
+        self.init_db()
 
     def load_config(self):
         """Загружаем конфигурацию из файла"""
@@ -32,25 +27,39 @@ class SteamMarketMonitor:
                     'AWP | Asiimov (Field-Tested)'
                 ],
                 'check_interval': 3600,
-                'output_file': 'steam_prices.xlsx',
-                'history_file': 'price_history.json'
+                'db_file': 'steam_prices.db'
             }
             with open('config.json', 'w', encoding='utf-8') as f:
                 json.dump(default_config, f, indent=4)
             return default_config
 
-    def load_history(self):
-        """Загружаем историю цен"""
-        try:
-            with open(self.history_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
-
-    def save_history(self):
-        """Сохраняем историю цен"""
-        with open(self.history_file, 'w', encoding='utf-8') as f:
-            json.dump(self.price_history, f, indent=4)
+    def init_db(self):
+        """Инициализация базы данных SQLite"""
+        self.conn = sqlite3.connect(self.db_file)
+        self.cursor = self.conn.cursor()
+        
+        # Создаем таблицу если ее нет
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS price_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_name TEXT NOT NULL,
+            price REAL NOT NULL,
+            timestamp DATETIME NOT NULL,
+            price_change REAL,
+            UNIQUE(item_name, timestamp)
+        )
+        ''')
+        
+        # Создаем таблицу для последних цен
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS last_prices (
+            item_name TEXT PRIMARY KEY,
+            last_price REAL NOT NULL,
+            last_update DATETIME NOT NULL
+        )
+        ''')
+        
+        self.conn.commit()
 
     def get_steam_market_price(self, item_name):
         """Получаем текущую цену предмета на Steam Market"""
@@ -71,76 +80,86 @@ class SteamMarketMonitor:
 
     def check_price_changes(self):
         """Проверяем изменения цен для всех предметов"""
-        current_prices = {}
-        changes = []
-        
-        print(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Начинаем проверку цен...")
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"\n{current_time} - Начинаем проверку цен...")
         
         for item in self.items:
             price = self.get_steam_market_price(item)
             if price is None:
                 continue
                 
-            current_prices[item] = price
-            previous_price = self.price_history.get(item)
+            # Получаем последнюю цену из базы
+            self.cursor.execute(
+                'SELECT last_price FROM last_prices WHERE item_name = ?',
+                (item,)
+            )
+            result = self.cursor.fetchone()
+            previous_price = result[0] if result else None
             
-            if previous_price is not None and previous_price != price:
-                change = price - previous_price
-                change_percent = (change / previous_price) * 100
-                changes.append((item, previous_price, price, change, change_percent))
-                print(f"ИЗМЕНЕНИЕ: {item} - было ${previous_price:.2f}, стало ${price:.2f} ({change:+.2f}, {change_percent:+.2f}%)")
-            
-            self.price_history[item] = price
-        
-        self.save_history()
-        self.update_spreadsheet(current_prices, changes)
-        return changes
-
-    def update_spreadsheet(self, current_prices, changes):
-        """Обновляем таблицу Excel с текущими ценами"""
-        try:
-            # Создаем новый DataFrame с текущими данными
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            new_data = []
-            
-            for item, price in current_prices.items():
-                change_info = next((c for c in changes if c[0] == item), None)
-                change = change_info[3] if change_info else 0
-                
-                new_data.append({
-                    'Item': item,
-                    'Price': price,
-                    'Timestamp': timestamp,
-                    'Change': change
-                })
-            
-            new_df = pd.DataFrame(new_data)
-            
-            # Читаем существующие данные и объединяем с новыми
-            if os.path.exists(self.output_file):
-                try:
-                    existing_df = pd.read_excel(self.output_file)
-                    combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-                except Exception as e:
-                    print(f"Ошибка при чтении существующего файла, создаем новый: {e}")
-                    combined_df = new_df
+            # Рассчитываем изменение цены
+            price_change = None
+            if previous_price is not None:
+                price_change = price - previous_price
+                print(
+                    f"{item}: ${price:.2f} "
+                    f"({price_change:+.2f} {'↑' if price_change >= 0 else '↓'})"
+                )
             else:
-                combined_df = new_df
+                print(f"{item}: ${price:.2f} (новая запись)")
             
-            # Сохраняем данные
-            with pd.ExcelWriter(self.output_file, engine='openpyxl') as writer:
-                combined_df.to_excel(writer, index=False)
+            # Записываем в историю
+            self.cursor.execute('''
+            INSERT OR IGNORE INTO price_history 
+            (item_name, price, timestamp, price_change)
+            VALUES (?, ?, ?, ?)
+            ''', (item, price, current_time, price_change))
             
-            print(f"Данные успешно записаны в {self.output_file}")
+            # Обновляем последнюю цену
+            self.cursor.execute('''
+            INSERT OR REPLACE INTO last_prices 
+            (item_name, last_price, last_update)
+            VALUES (?, ?, ?)
+            ''', (item, price, current_time))
             
+            self.conn.commit()
+
+    def get_price_history(self, item_name, limit=10):
+        """Получаем историю цен для конкретного предмета"""
+        self.cursor.execute('''
+        SELECT item_name, price, timestamp, price_change 
+        FROM price_history 
+        WHERE item_name = ?
+        ORDER BY timestamp DESC
+        LIMIT ?
+        ''', (item_name, limit))
+        
+        return self.cursor.fetchall()
+
+    def export_to_csv(self, filename='steam_prices.csv'):
+        """Экспорт данных в CSV файл"""
+        try:
+            self.cursor.execute('''
+            SELECT item_name, price, timestamp, price_change 
+            FROM price_history 
+            ORDER BY timestamp DESC
+            ''')
+            
+            import csv
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Item', 'Price', 'Timestamp', 'Price Change'])
+                writer.writerows(self.cursor.fetchall())
+            
+            print(f"Данные экспортированы в {filename}")
         except Exception as e:
-            print(f"Ошибка при обновлении таблицы: {e}")
+            print(f"Ошибка при экспорте в CSV: {e}")
 
     def run(self):
         """Запускаем мониторинг"""
-        print("Steam Market Monitor запущен")
+        print("Steam Market Monitor (SQLite) запущен")
         print(f"Отслеживаем предметы: {', '.join(self.items)}")
         print(f"Интервал проверки: {self.check_interval} секунд")
+        print(f"База данных: {self.db_file}")
         
         try:
             while True:
@@ -148,6 +167,7 @@ class SteamMarketMonitor:
                 time.sleep(self.check_interval)
         except KeyboardInterrupt:
             print("\nМониторинг остановлен")
+            self.conn.close()
 
 if __name__ == "__main__":
     monitor = SteamMarketMonitor()
