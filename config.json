@@ -1,0 +1,9 @@
+{
+    "items_to_track": [
+        "AK-47 | Redline (Field-Tested)",
+        "AWP | Asiimov (Field-Tested)"
+    ],
+    "check_interval": 36,
+    "output_file": "steam_prices.xlsx",
+    "history_file": "price_history.json"
+}
